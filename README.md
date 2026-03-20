@@ -32,7 +32,9 @@ cd whatsapp-mcp
 
 **2. First run — scan the QR code**
 
-The bridge needs an interactive terminal on the very first run to display the QR code.
+Two ways to authenticate on first run:
+
+**Option 1 — Terminal QR (interactive)**
 
 ```bash
 # Docker
@@ -42,7 +44,27 @@ docker compose run --rm -it bridge
 podman compose run --rm -it bridge
 ```
 
-Scan the QR code with WhatsApp on your phone: **Settings → Linked Devices → Link a Device**.
+Scan the QR code printed in the terminal with WhatsApp: **Settings → Linked Devices → Link a Device**.
+
+**Option 2 — HTTP QR (headless / daemon)**
+
+Start the bridge as a daemon and fetch the QR code via HTTP:
+
+```bash
+docker compose up -d
+```
+
+Then poll the QR endpoint until a code is available:
+
+```bash
+# Check status
+curl http://localhost:8080/api/auth/status
+
+# Get QR as base64 PNG
+curl http://localhost:8080/api/auth/qr
+```
+
+The response contains a `qr` field (base64-encoded PNG) you can decode and display, and a `qr_raw` field (raw string) for terminal rendering. The QR refreshes automatically; poll until `status.logged_in` is `true`.
 
 The session is saved to `./store/whatsapp.db`. You won't need to scan again unless you explicitly log out.
 
@@ -96,6 +118,11 @@ docker compose logs -f bridge     # tail bridge logs
 docker compose stop bridge        # stop daemon
 docker compose start bridge       # start again (no QR needed)
 docker compose down               # stop and remove container (store/ kept)
+
+# Auth endpoints (bridge must be running)
+curl http://localhost:8080/api/auth/status   # check connection state
+curl http://localhost:8080/api/auth/qr       # get QR as base64 PNG (during pairing only)
+curl -X POST http://localhost:8080/api/auth/logout  # disconnect session
 
 # Reset session (forces QR re-scan)
 rm store/whatsapp.db store/messages.db
@@ -216,8 +243,9 @@ WhatsApp
 
 ## Troubleshooting
 
-**QR code not showing**
+**QR code not showing in terminal**
 Run with `-it` flag: `docker compose run --rm -it bridge`
+Or start as daemon and use `GET /api/auth/qr` to fetch the QR as a base64 PNG.
 
 **Already logged in**
 The bridge reconnects automatically — no QR needed.
