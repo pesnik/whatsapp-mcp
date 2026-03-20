@@ -66,7 +66,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "whatsapp": {
-      "command": "/path/to/uv",
+      "command": "uv",
       "args": [
         "--directory",
         "/path/to/whatsapp-mcp/whatsapp-mcp-server",
@@ -74,15 +74,16 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
         "main.py"
       ],
       "env": {
-        "WHATSAPP_DB_PATH":      "/path/to/whatsapp-mcp/store/messages.db",
-        "WHATSAPP_API_BASE_URL": "http://localhost:8080/api"
+        "WHATSAPP_DB_PATH": "/path/to/whatsapp-mcp/store/messages.db"
       }
     }
   }
 }
 ```
 
-Replace `/path/to/uv` with the output of `which uv` and `/path/to/whatsapp-mcp` with your clone path.
+Replace `/path/to/whatsapp-mcp` with wherever you cloned the repo.
+`WHATSAPP_DB_PATH` points to `store/` which is bind-mounted from the container to the host.
+`WHATSAPP_API_BASE_URL` defaults to `http://localhost:8080/api` — no need to set it.
 
 **5. Restart Claude Desktop**
 
@@ -137,7 +138,7 @@ nohup go run main.go > bridge.log 2>&1 &
 {
   "mcpServers": {
     "whatsapp": {
-      "command": "/path/to/uv",
+      "command": "uv",
       "args": [
         "--directory",
         "/path/to/whatsapp-mcp/whatsapp-mcp-server",
@@ -148,6 +149,8 @@ nohup go run main.go > bridge.log 2>&1 &
   }
 }
 ```
+
+Replace `/path/to/whatsapp-mcp` with your clone path. No `env` block needed — the MCP server resolves the DB path relative to itself automatically.
 
 Save to `~/Library/Application Support/Claude/claude_desktop_config.json` (Claude Desktop) or `~/.cursor/mcp.json` (Cursor).
 
