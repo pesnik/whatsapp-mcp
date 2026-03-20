@@ -1,0 +1,16 @@
+services:
+  bridge:
+    build:
+      context: whatsapp-bridge
+      dockerfile: Dockerfile
+    image: pesnik/whatsapp-bridge:latest
+    container_name: whatsapp-bridge
+    ports:
+      - "127.0.0.1:8080:8080"   # REST API — localhost only
+    volumes:
+      - ./store:/app/store       # persists session + message DB on host
+    restart: unless-stopped
+    # stdin_open + tty only needed for first-run QR scan.
+    # After session is saved in ./store/, daemon mode works fine.
+    stdin_open: false
+    tty: false
