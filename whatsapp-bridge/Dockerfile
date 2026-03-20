@@ -9,7 +9,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=1 GOOS=linux go build -trimpath -ldflags="-s -w" -o /bridge .
+RUN go mod tidy && CGO_ENABLED=1 GOOS=linux go build -trimpath -ldflags="-s -w" -o /bridge .
 
 # ── Runtime ──────────────────────────────────────────────────────────────────
 FROM alpine:3.21
