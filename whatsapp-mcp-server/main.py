@@ -1,3 +1,4 @@
+import os
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -15,8 +16,21 @@ from whatsapp import (
     download_media as whatsapp_download_media
 )
 
-# Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+# Initialize FastMCP server -- network-reachable by default (SSE), not
+# parent-process-only stdio. opencode-hub (and any other multi-tenant
+# host) needs to reach this from a *different* container over the
+# network; stdio only ever works when the MCP client launches this
+# process directly as its own child, which isn't the shape here. Host/
+# port stay env-configurable, matching this fork's own existing pattern
+# (see whatsapp.py's WHATSAPP_DB_PATH/WHATSAPP_API_BASE_URL) rather than
+# hardcoded, so a plain `python main.py` still works unchanged for the
+# original single-user/stdio use case if WHATSAPP_MCP_TRANSPORT is left
+# at its default.
+MCP_TRANSPORT = os.environ.get("WHATSAPP_MCP_TRANSPORT", "stdio")
+MCP_HOST = os.environ.get("WHATSAPP_MCP_HOST", "0.0.0.0")
+MCP_PORT = int(os.environ.get("WHATSAPP_MCP_PORT", "8081"))
+
+mcp = FastMCP("whatsapp", host=MCP_HOST, port=MCP_PORT)
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -248,4 +262,4 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     # Initialize and run the server
-    mcp.run(transport='stdio')
+    mcp.run(transport=MCP_TRANSPORT)
