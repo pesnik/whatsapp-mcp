@@ -200,6 +200,24 @@ type AuthState struct {
 	AuthInProgress bool
 }
 
+// PresenceInfo is the last-known presence WhatsApp pushed us for one contact.
+// Only populated for JIDs we've called SubscribePresence on -- WhatsApp does
+// not push presence for anyone we haven't explicitly subscribed to, and even
+// then only if their own privacy settings allow it (LastSeen is the zero
+// value when they've hidden it -- that's enforced server-side, not something
+// this bridge can see around).
+type PresenceInfo struct {
+	Unavailable bool      `json:"unavailable"`
+	LastSeen    time.Time `json:"last_seen,omitempty"`
+}
+
+// presenceCache holds the last PresenceInfo we've observed per JID, filled by
+// the *events.Presence handler below and read back by GET /api/presence/{jid}.
+var presenceCache = struct {
+	sync.RWMutex
+	m map[string]PresenceInfo
+}{m: make(map[string]PresenceInfo)}
+
 var authState = &AuthState{}
 
 // SendMessageResponse represents the response for the send message API
@@ -736,6 +754,103 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// POST /api/presence -- broadcast our own online/offline status.
+	// Deliberately a manual, agent-invoked action, not an automatic
+	// background ping loop: an account that's *always* online 24/7 is
+	// itself a detectable automation signal (confirmed against a sibling
+	// fork's own docs, which pings on a 20min+ interval specifically to
+	// avoid that) -- left as a tool the calling agent decides when to use,
+	// same as send_message, rather than new always-on scheduler infra.
+	http.HandleFunc("/api/presence", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		var req struct {
+			Available bool `json:"available"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "Invalid request format"})
+			return
+		}
+
+		state := types.PresenceUnavailable
+		if req.Available {
+			state = types.PresenceAvailable
+		}
+		if err := client.SendPresence(r.Context(), state); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("Failed to send presence: %v", err)})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Presence updated"})
+	})
+
+	// POST /api/presence/subscribe -- ask WhatsApp to start pushing us
+	// presence updates for one contact. Required before GET
+	// /api/presence/{jid} below will ever return anything for that
+	// contact; WhatsApp does not push presence unsolicited.
+	http.HandleFunc("/api/presence/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		var req struct {
+			JID string `json:"jid"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.JID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "jid is required"})
+			return
+		}
+
+		jid, err := types.ParseJID(req.JID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("Invalid JID: %v", err)})
+			return
+		}
+		if err := client.SubscribePresence(r.Context(), jid); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("Failed to subscribe: %v", err)})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Subscribed"})
+	})
+
+	// GET /api/presence?jid=... -- last-known presence for a contact
+	// we've subscribed to (empty/absent until at least one events.Presence
+	// has arrived for it).
+	http.HandleFunc("/api/presence/get", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		jid := r.URL.Query().Get("jid")
+		if jid == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "jid query param is required"})
+			return
+		}
+
+		presenceCache.RLock()
+		info, ok := presenceCache.m[jid]
+		presenceCache.RUnlock()
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "No presence known for this JID yet -- subscribe first, then wait for an update"})
+			return
+		}
+
+		resp := map[string]interface{}{"success": true, "unavailable": info.Unavailable}
+		if !info.LastSeen.IsZero() {
+			resp["last_seen"] = info.LastSeen.Unix()
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -953,6 +1068,14 @@ func main() {
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+
+		case *events.Presence:
+			presenceCache.Lock()
+			presenceCache.m[v.From.String()] = PresenceInfo{
+				Unavailable: v.Unavailable,
+				LastSeen:    v.LastSeen,
+			}
+			presenceCache.Unlock()
 		}
 	})
 

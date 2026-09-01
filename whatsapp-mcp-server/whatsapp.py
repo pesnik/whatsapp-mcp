@@ -651,6 +651,68 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
+def set_presence(available: bool) -> Tuple[bool, str]:
+    """Broadcast this account's own online/offline status. A manual action,
+    not an automatic background ping -- an account that's always online is
+    itself a detectable automation signal, so the caller decides when."""
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/presence"
+        response = requests.post(url, json={"available": available})
+
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def subscribe_presence(jid: str) -> Tuple[bool, str]:
+    """Ask WhatsApp to start pushing presence updates for one contact.
+    Required before get_presence will ever return anything for them --
+    WhatsApp never pushes presence unsolicited, and even after subscribing,
+    what comes back is still subject to that contact's own privacy settings."""
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/presence/subscribe"
+        response = requests.post(url, json={"jid": jid})
+
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def get_presence(jid: str) -> Optional[dict]:
+    """Last-known presence for a subscribed contact: {"unavailable": bool,
+    "last_seen": unix_timestamp (omitted if they've hidden it)}. None if we
+    haven't seen an update for them yet (subscribe, then this needs a
+    moment for WhatsApp to actually push one)."""
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/presence/get"
+        response = requests.get(url, params={"jid": jid})
+
+        if response.status_code != 200:
+            return None
+        result = response.json()
+        if not result.get("success"):
+            return None
+        return {"unavailable": result.get("unavailable", False), "last_seen": result.get("last_seen")}
+
+    except (requests.RequestException, json.JSONDecodeError):
+        return None
+
 def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
     try:
         # Validate input

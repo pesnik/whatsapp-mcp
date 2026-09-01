@@ -12,6 +12,9 @@ from whatsapp import (
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
+    set_presence as whatsapp_set_presence,
+    subscribe_presence as whatsapp_subscribe_presence,
+    get_presence as whatsapp_get_presence,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
@@ -218,6 +221,50 @@ def send_message(
         "success": success,
         "message": status_message
     }
+
+@mcp.tool()
+def set_presence(available: bool) -> Dict[str, Any]:
+    """Broadcast this WhatsApp account's own online/offline status to contacts.
+
+    A manual action, not automatic -- call it deliberately (e.g. before sending
+    a message) rather than every turn, since an account that's always "online"
+    is itself a signal that it's automated, not a person.
+
+    Args:
+        available: True to appear online, False to appear offline
+    """
+    success, status_message = whatsapp_set_presence(available)
+    return {"success": success, "message": status_message}
+
+@mcp.tool()
+def subscribe_presence(jid: str) -> Dict[str, Any]:
+    """Start receiving presence (online/last seen) updates for one contact.
+
+    Required before get_presence returns anything useful for that contact --
+    WhatsApp never pushes presence for someone you haven't subscribed to, and
+    what you get after subscribing still depends on their own privacy settings.
+
+    Args:
+        jid: The contact's JID (e.g. "123456789@s.whatsapp.net")
+    """
+    success, status_message = whatsapp_subscribe_presence(jid)
+    return {"success": success, "message": status_message}
+
+@mcp.tool()
+def get_presence(jid: str) -> Optional[Dict[str, Any]]:
+    """Get the last-known presence for a contact you've subscribed to.
+
+    Returns None if no presence update has arrived yet for this JID (call
+    subscribe_presence first, then allow a moment for WhatsApp to push one).
+
+    Args:
+        jid: The contact's JID (e.g. "123456789@s.whatsapp.net")
+
+    Returns:
+        A dict with "unavailable" (bool) and "last_seen" (unix timestamp,
+        omitted if the contact has hidden it), or None if unknown.
+    """
+    return whatsapp_get_presence(jid)
 
 @mcp.tool()
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
