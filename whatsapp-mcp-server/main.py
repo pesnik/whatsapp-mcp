@@ -1,4 +1,5 @@
 import os
+from dataclasses import asdict, is_dataclass
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -32,6 +33,27 @@ MCP_PORT = int(os.environ.get("WHATSAPP_MCP_PORT", "8081"))
 
 mcp = FastMCP("whatsapp", host=MCP_HOST, port=MCP_PORT)
 
+# whatsapp.py's own functions return real @dataclass instances (Chat,
+# Message, Contact, MessageContext -- see whatsapp.py:14-49), but every
+# tool below is declared to return a plain dict/list of dicts and was
+# just handing the dataclass straight through unconverted. That worked
+# under older/looser MCP clients, but mcp[cli]>=1.6.0's FastMCP validates
+# a tool's actual return value against its declared type before sending
+# it -- a raw dataclass instance fails that check with a real Pydantic
+# "Input should be a valid dictionary" error (caught live: every read
+# tool that touches a Chat/Message was broken this way). asdict() is
+# stdlib-recursive, so it converts nested dataclasses (MessageContext's
+# own message/before/after fields) in one call; leftover datetime values
+# inside the resulting dict serialize fine on their own -- pydantic's
+# Any-serializer already knows how to encode datetime, only the outer
+# "is this actually a dict" check was the problem.
+def _to_jsonable(value):
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)
+    if isinstance(value, list):
+        return [_to_jsonable(v) for v in value]
+    return value
+
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
     """Search WhatsApp contacts by name or phone number.
@@ -40,7 +62,7 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
         query: Search term to match against contact names or phone numbers
     """
     contacts = whatsapp_search_contacts(query)
-    return contacts
+    return _to_jsonable(contacts)
 
 @mcp.tool()
 def list_messages(
@@ -81,7 +103,7 @@ def list_messages(
         context_before=context_before,
         context_after=context_after
     )
-    return messages
+    return _to_jsonable(messages)
 
 @mcp.tool()
 def list_chats(
@@ -107,40 +129,40 @@ def list_chats(
         include_last_message=include_last_message,
         sort_by=sort_by
     )
-    return chats
+    return _to_jsonable(chats)
 
 @mcp.tool()
-def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
+def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Dict[str, Any]]:
     """Get WhatsApp chat metadata by JID.
-    
+
     Args:
         chat_jid: The JID of the chat to retrieve
         include_last_message: Whether to include the last message (default True)
     """
     chat = whatsapp_get_chat(chat_jid, include_last_message)
-    return chat
+    return _to_jsonable(chat) if chat is not None else None
 
 @mcp.tool()
-def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
+def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Dict[str, Any]]:
     """Get WhatsApp chat metadata by sender phone number.
-    
+
     Args:
         sender_phone_number: The phone number to search for
     """
     chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
-    return chat
+    return _to_jsonable(chat) if chat is not None else None
 
 @mcp.tool()
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
     """Get all WhatsApp chats involving the contact.
-    
+
     Args:
         jid: The contact's JID to search for
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
     chats = whatsapp_get_contact_chats(jid, limit, page)
-    return chats
+    return _to_jsonable(chats)
 
 @mcp.tool()
 def get_last_interaction(jid: str) -> str:
@@ -166,7 +188,7 @@ def get_message_context(
         after: Number of messages to include after the target message (default 5)
     """
     context = whatsapp_get_message_context(message_id, before, after)
-    return context
+    return _to_jsonable(context)
 
 @mcp.tool()
 def send_message(
