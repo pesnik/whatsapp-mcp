@@ -198,13 +198,22 @@ def send_message(
     recipient: str,
     message: str
 ) -> Dict[str, Any]:
-    """Send a WhatsApp message to a person or group. For group chats use the JID.
+    """Send a WhatsApp message to a person or group.
 
     Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+        recipient: A phone number with country code but no + or other symbols,
+                 a JID (e.g., "123456789@s.whatsapp.net" or a group JID like
+                 "123456789@g.us"), OR a plain display name -- a name is
+                 automatically resolved against your already-synced chats and
+                 contacts (the same lookup list_chats/search_contacts use) if
+                 it matches exactly one. If it matches none or more than one,
+                 this returns success=false with the real candidates found
+                 (or a note that nothing matched) instead of attempting to
+                 send -- don't retry blindly on that kind of failure, resolve
+                 the ambiguity (via list_chats/search_contacts, or by asking
+                 the user) and call this again with the exact JID.
         message: The message text to send
-    
+
     Returns:
         A dictionary containing success status and a status message
     """
@@ -268,11 +277,13 @@ def get_presence(jid: str) -> Optional[Dict[str, Any]]:
 
 @mcp.tool()
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
-    """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
-    
+    """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient.
+
     Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+        recipient: A phone number, a JID, or a plain display name -- same
+                 automatic name resolution (and same fail-fast-on-ambiguity
+                 behavior) as send_message. See send_message's own docstring
+                 for the details.
         media_path: The absolute path to the media file to send (image, video, document)
     
     Returns:
@@ -288,11 +299,13 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
 
 @mcp.tool()
 def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
-    """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
-    
+    """Send any audio file as a WhatsApp audio message to the specified recipient. If it errors due to ffmpeg not being installed, use send_file instead.
+
     Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+        recipient: A phone number, a JID, or a plain display name -- same
+                 automatic name resolution (and same fail-fast-on-ambiguity
+                 behavior) as send_message. See send_message's own docstring
+                 for the details.
         media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
     
     Returns:
