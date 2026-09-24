@@ -854,6 +854,41 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// GET /api/chats -- list all known chats (groups and DMs)
+	http.HandleFunc("/api/chats", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		chats, err := messageStore.GetChats()
+		if err != nil {
+			http.Error(w, "Failed to get chats", http.StatusInternalServerError)
+			return
+		}
+		type ChatInfo struct {
+			JID       string `json:"jid"`
+			Name      string `json:"name"`
+			IsGroup   bool   `json:"is_group"`
+			LastActive int64  `json:"last_active"`
+		}
+		var result []ChatInfo
+		for jid, t := range chats {
+			name := ""
+			err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", jid).Scan(&name)
+			if err != nil {
+				name = ""
+			}
+			result = append(result, ChatInfo{
+				JID:       jid,
+				Name:      name,
+				IsGroup:   strings.HasSuffix(jid, "@g.us"),
+				LastActive: t.Unix(),
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	})
+
 	// POST /api/presence -- broadcast our own online/offline status.
 	// Deliberately a manual, agent-invoked action, not an automatic
 	// background ping loop: an account that's *always* online 24/7 is
