@@ -533,14 +533,20 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	if isGroup && client.Store.ID != nil {
 		botUser := client.Store.ID.User
-		// Check mentions in extended text messages
+		// Check mentions in extended text messages (protocol-level @mentions)
 		if extMsg := msg.Message.GetExtendedTextMessage(); extMsg != nil {
 			for _, mentionedJID := range extMsg.GetContextInfo().GetMentionedJID() {
-				// mentionedJID is a string like "1234567890:12@s.whatsapp.net"
-				if strings.HasPrefix(mentionedJID, botUser+"@") || mentionedJID == botUser {
+				// Match by phone number prefix (handles both @s.whatsapp.net and @lid formats)
+				if strings.HasPrefix(mentionedJID, botUser+"@") || strings.HasPrefix(mentionedJID, botUser+":") || mentionedJID == botUser {
 					isMentioned = true
 					break
 				}
+			}
+		}
+		// Fallback: also check plain text for @<phone> pattern (non-protocol mentions)
+		if !isMentioned && content != "" {
+			if strings.Contains(content, "@"+botUser) {
+				isMentioned = true
 			}
 		}
 	} else if !isGroup {
