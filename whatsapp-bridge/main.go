@@ -174,6 +174,53 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
+// ---------------------------------------------------------------------------
+// In-memory message cache (last 50 messages per chat) for reply lookup
+// ---------------------------------------------------------------------------
+
+type cachedMessage struct {
+	msgID     string
+	senderJID string
+	body      string
+	ts        int64
+}
+
+var messageCache = struct {
+	sync.RWMutex
+	chats map[string][]cachedMessage // chatJID → messages (oldest first)
+}{chats: make(map[string][]cachedMessage)}
+
+const maxCachedMessages = 50
+
+func cacheMessage(chatJID, msgID, senderJID, body string, ts int64) {
+	if msgID == "" || body == "" {
+		return
+	}
+	messageCache.Lock()
+	defer messageCache.Unlock()
+	msgs := messageCache.chats[chatJID]
+	msgs = append(msgs, cachedMessage{msgID, senderJID, body, ts})
+	if len(msgs) > maxCachedMessages {
+		msgs = msgs[len(msgs)-maxCachedMessages:]
+	}
+	messageCache.chats[chatJID] = msgs
+}
+
+func lookupCachedMessage(chatJID, msgID string) *cachedMessage {
+	if msgID == "" {
+		return nil
+	}
+	messageCache.RLock()
+	defer messageCache.RUnlock()
+	msgs := messageCache.chats[chatJID]
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].msgID == msgID {
+			return &msgs[i]
+		}
+	}
+	return nil
+}
+
 // Extract text content from a message
 func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {
@@ -242,16 +289,19 @@ type BotSendRequest struct {
 
 // MentionEvent is emitted to stdout when the bot is mentioned in a chat
 type MentionEvent struct {
-	Type       string `json:"type"`
-	MessageID  string `json:"messageId"`
-	ChatJID    string `json:"chatJid"`
-	ChatName   string `json:"chatName"`
-	SenderJID  string `json:"senderJid"`
-	SenderName string `json:"senderName"`
-	Body       string `json:"body"`
-	Timestamp  int64  `json:"timestamp"`
-	IsFromMe   bool   `json:"isFromMe"`
-	IsMention  bool   `json:"isMention"`
+	Type          string `json:"type"`
+	MessageID     string `json:"messageId"`
+	ChatJID       string `json:"chatJid"`
+	ChatName      string `json:"chatName"`
+	SenderJID     string `json:"senderJid"`
+	SenderName    string `json:"senderName"`
+	Body          string `json:"body"`
+	Timestamp     int64  `json:"timestamp"`
+	IsFromMe      bool   `json:"isFromMe"`
+	IsMention     bool   `json:"isMention"`
+	QuotedMsgID   string `json:"quotedMsgId,omitempty"`
+	QuotedMsgBody string `json:"quotedMsgBody,omitempty"`
+	IsReplyToBot  bool   `json:"isReplyToBot,omitempty"`
 }
 
 // Function to send a WhatsApp message
@@ -523,14 +573,24 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Skip mention detection for messages sent by the bot itself
 	if msg.Info.IsFromMe {
+		// Still cache bot's own messages so we can look them up when someone replies
+		cacheMessage(chatJID, msg.Info.ID, sender, content, msg.Info.Timestamp.Unix())
 		return
 	}
+
+	// Cache every incoming message for reply lookup
+	cacheMessage(chatJID, msg.Info.ID, sender, content, msg.Info.Timestamp.Unix())
 
 	// Detect if this is a group chat
 	isGroup := strings.HasSuffix(chatJID, "@g.us")
 
 	// Determine if the bot was mentioned
 	isMentioned := false
+
+	// Detect reply-to-bot
+	isReplyToBot := false
+	quotedMsgID := ""
+	quotedMsgBody := ""
 
 	if isGroup && client.Store.ID != nil {
 		botJID := client.Store.ID
@@ -547,10 +607,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			botJIDs[ownLID.String()] = true
 		}
 
-		// Check mentions in extended text messages (protocol-level @mentions)
 		if extMsg := msg.Message.GetExtendedTextMessage(); extMsg != nil {
-			for _, mentionedJID := range extMsg.GetContextInfo().GetMentionedJID() {
-				// Check if the mentioned JID matches any of the bot's JIDs
+			ctxInfo := extMsg.GetContextInfo()
+
+			// Check mentions in extended text messages (protocol-level @mentions)
+			for _, mentionedJID := range ctxInfo.GetMentionedJID() {
 				for matchJID := range botJIDs {
 					if strings.HasPrefix(mentionedJID, matchJID) || mentionedJID == matchJID {
 						isMentioned = true
@@ -559,6 +620,23 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 				}
 				if isMentioned {
 					break
+				}
+			}
+
+			// Detect reply-to-bot: ContextInfo.StanzaID is non-empty when replying
+			if stanzaID := ctxInfo.GetStanzaID(); stanzaID != "" {
+				quotedMsgID = stanzaID
+				// Check if participant matches any bot JID
+				participant := ctxInfo.GetParticipant()
+				for matchJID := range botJIDs {
+					if strings.HasPrefix(participant, matchJID) || participant == matchJID {
+						isReplyToBot = true
+						break
+					}
+				}
+				// Look up quoted message body in cache
+				if qMsg := lookupCachedMessage(chatJID, stanzaID); qMsg != nil {
+					quotedMsgBody = qMsg.body
 				}
 			}
 		}
@@ -576,24 +654,27 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		isMentioned = true
 	}
 
-	// For group messages, always emit so the hub can check @alias text patterns
+	// Emit if: mentioned, reply-to-bot, or group message (for alias detection in hub)
 	// For DMs, always emit (already treated as mentions above)
-	if !isMentioned && !isGroup {
+	if !isMentioned && !isReplyToBot && !isGroup {
 		return
 	}
 
 	// Emit structured mention event to stdout for MentionListener
 	evt := MentionEvent{
-		Type:       "mention",
-		MessageID:  msg.Info.ID,
-		ChatJID:    chatJID,
-		ChatName:   name,
-		SenderJID:  sender,
-		SenderName: name,
-		Body:       content,
-		Timestamp:  msg.Info.Timestamp.Unix(),
-		IsFromMe:   msg.Info.IsFromMe,
-		IsMention:  isMentioned,
+		Type:          "mention",
+		MessageID:     msg.Info.ID,
+		ChatJID:       chatJID,
+		ChatName:      name,
+		SenderJID:     sender,
+		SenderName:    name,
+		Body:          content,
+		Timestamp:     msg.Info.Timestamp.Unix(),
+		IsFromMe:      msg.Info.IsFromMe,
+		IsMention:     isMentioned,
+		QuotedMsgID:   quotedMsgID,
+		QuotedMsgBody: quotedMsgBody,
+		IsReplyToBot:  isReplyToBot,
 	}
 	evtJSON, _ := json.Marshal(evt)
 	fmt.Printf("OPENSENSE_BOT_EVENT:%s\n", string(evtJSON))
