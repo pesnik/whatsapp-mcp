@@ -533,21 +533,42 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	isMentioned := false
 
 	if isGroup && client.Store.ID != nil {
-		botUser := client.Store.ID.User
+		botJID := client.Store.ID
+		botUser := botJID.User
+
+		// Build a set of the bot's own JIDs to match against
+		botJIDs := make(map[string]bool)
+		botJIDs[botUser] = true     // phone number
+		botJIDs[botJID.String()] = true // full JID string
+
+		// Also add the bot's LID (WhatsApp uses LID for contact-based mentions)
+		if ownLID := client.Store.GetLID(); ownLID.User != "" {
+			botJIDs[ownLID.User] = true
+			botJIDs[ownLID.String()] = true
+		}
+
 		// Check mentions in extended text messages (protocol-level @mentions)
 		if extMsg := msg.Message.GetExtendedTextMessage(); extMsg != nil {
 			for _, mentionedJID := range extMsg.GetContextInfo().GetMentionedJID() {
-				// Match by phone number prefix (handles both @s.whatsapp.net and @lid formats)
-				if strings.HasPrefix(mentionedJID, botUser+"@") || strings.HasPrefix(mentionedJID, botUser+":") || mentionedJID == botUser {
-					isMentioned = true
+				// Check if the mentioned JID matches any of the bot's JIDs
+				for matchJID := range botJIDs {
+					if strings.HasPrefix(mentionedJID, matchJID) || mentionedJID == matchJID {
+						isMentioned = true
+						break
+					}
+				}
+				if isMentioned {
 					break
 				}
 			}
 		}
 		// Fallback: also check plain text for @<phone> pattern (non-protocol mentions)
 		if !isMentioned && content != "" {
-			if strings.Contains(content, "@"+botUser) {
-				isMentioned = true
+			for matchJID := range botJIDs {
+				if strings.Contains(content, "@"+matchJID) {
+					isMentioned = true
+					break
+				}
 			}
 		}
 	} else if !isGroup {
