@@ -233,6 +233,26 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+// BotSendRequest represents the request body for the /api/messages/send endpoint
+// Used by MentionListener to send bot responses back to WhatsApp
+type BotSendRequest struct {
+	To      string `json:"to"`
+	Message string `json:"message"`
+}
+
+// MentionEvent is emitted to stdout when the bot is mentioned in a chat
+type MentionEvent struct {
+	Type       string `json:"type"`
+	MessageID  string `json:"messageId"`
+	ChatJID    string `json:"chatJid"`
+	ChatName   string `json:"chatName"`
+	SenderJID  string `json:"senderJid"`
+	SenderName string `json:"senderName"`
+	Body       string `json:"body"`
+	Timestamp  int64  `json:"timestamp"`
+	IsFromMe   bool   `json:"isFromMe"`
+}
+
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
@@ -499,6 +519,53 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 	}
+
+	// Skip mention detection for messages sent by the bot itself
+	if msg.Info.IsFromMe {
+		return
+	}
+
+	// Detect if this is a group chat
+	isGroup := strings.HasSuffix(chatJID, "@g.us")
+
+	// Determine if the bot was mentioned
+	isMentioned := false
+
+	if isGroup && client.Store.ID != nil {
+		botUser := client.Store.ID.User
+		// Check mentions in extended text messages
+		if extMsg := msg.Message.GetExtendedTextMessage(); extMsg != nil {
+			for _, mentionedJID := range extMsg.GetContextInfo().GetMentionedJID() {
+				// mentionedJID is a string like "1234567890:12@s.whatsapp.net"
+				if strings.HasPrefix(mentionedJID, botUser+"@") || mentionedJID == botUser {
+					isMentioned = true
+					break
+				}
+			}
+		}
+	} else if !isGroup {
+		// In DMs, all incoming messages are treated as mentions
+		isMentioned = true
+	}
+
+	if !isMentioned {
+		return
+	}
+
+	// Emit structured mention event to stdout for MentionListener
+	evt := MentionEvent{
+		Type:       "mention",
+		MessageID:  msg.Info.ID,
+		ChatJID:    chatJID,
+		ChatName:   name,
+		SenderJID:  sender,
+		SenderName: name,
+		Body:       content,
+		Timestamp:  msg.Info.Timestamp.Unix(),
+		IsFromMe:   msg.Info.IsFromMe,
+	}
+	evtJSON, _ := json.Marshal(evt)
+	fmt.Printf("OPENSENSE_BOT_EVENT:%s\n", string(evtJSON))
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -751,6 +818,39 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(SendMessageResponse{
 			Success: success,
 			Message: message,
+		})
+	})
+
+	// POST /api/messages/send -- send a text message (used by MentionListener)
+	http.HandleFunc("/api/messages/send", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req BotSendRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.To == "" {
+			http.Error(w, "to is required", http.StatusBadRequest)
+			return
+		}
+		if req.Message == "" {
+			http.Error(w, "message is required", http.StatusBadRequest)
+			return
+		}
+
+		success, msg := sendWhatsAppMessage(client, req.To, req.Message, "")
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{
+			Success: success,
+			Message: msg,
 		})
 	})
 
