@@ -251,6 +251,7 @@ type MentionEvent struct {
 	Body       string `json:"body"`
 	Timestamp  int64  `json:"timestamp"`
 	IsFromMe   bool   `json:"isFromMe"`
+	IsMention  bool   `json:"isMention"`
 }
 
 // Function to send a WhatsApp message
@@ -554,7 +555,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		isMentioned = true
 	}
 
-	if !isMentioned {
+	// For group messages, always emit so the hub can check @alias text patterns
+	// For DMs, always emit (already treated as mentions above)
+	if !isMentioned && !isGroup {
 		return
 	}
 
@@ -569,6 +572,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		Body:       content,
 		Timestamp:  msg.Info.Timestamp.Unix(),
 		IsFromMe:   msg.Info.IsFromMe,
+		IsMention:  isMentioned,
 	}
 	evtJSON, _ := json.Marshal(evt)
 	fmt.Printf("OPENSENSE_BOT_EVENT:%s\n", string(evtJSON))
