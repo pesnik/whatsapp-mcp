@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
@@ -33,5 +35,21 @@ func TestSenderPhonePrefersPhoneJID(t *testing.T) {
 	}}
 	if got := senderPhone(info); got != "8801700000000" {
 		t.Fatalf("expected phone from SenderAlt, got %q", got)
+	}
+}
+
+func TestConfigureDeviceIdentity(t *testing.T) {
+	t.Setenv("WHATSAPP_DEVICE_NAME", "")
+	configureDeviceIdentity()
+	if got := store.DeviceProps.GetOs(); got != "AgentsHQ" {
+		t.Fatalf("default device name: %q", got)
+	}
+	if store.DeviceProps.GetPlatformType() != waCompanionReg.DeviceProps_DESKTOP {
+		t.Fatal("expected DESKTOP platform type")
+	}
+	t.Setenv("WHATSAPP_DEVICE_NAME", "Custom")
+	configureDeviceIdentity()
+	if got := store.DeviceProps.GetOs(); got != "Custom" {
+		t.Fatalf("override not applied: %q", got)
 	}
 }

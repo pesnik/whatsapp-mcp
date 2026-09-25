@@ -439,6 +439,9 @@ type BotSendRequest struct {
 // without this the bot's own replies never reach messages.db.
 var activeMessageStore *MessageStore
 
+// activePresence keeps "last active" fresh while the bot works (device.go).
+var activePresence *presenceKeeper
+
 // recordSentMessage stores an outgoing text message and caches it for
 // reply lookup.
 func recordSentMessage(client *whatsmeow.Client, chat types.JID, id types.MessageID, ts time.Time, text, quotedID string) {
@@ -1159,6 +1162,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 				ContextInfo: ctx,
 			}}
 		}
+		activePresence.activeFor(30 * time.Second)
 		resp, err := client.SendMessage(r.Context(), to, msg)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1200,6 +1204,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		state := types.ChatPresenceComposing
 		if req.State == "paused" {
 			state = types.ChatPresencePaused
+			// Linger briefly after the reply, like a person reading it back.
+			activePresence.activeFor(20 * time.Second)
+		} else {
+			// Typing is only shown to others while we're online.
+			activePresence.activeFor(3 * time.Minute)
 		}
 		if err := client.SendChatPresence(r.Context(), jid, state, types.ChatPresenceMediaText); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1294,11 +1303,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		state := types.PresenceUnavailable
-		if req.Available {
-			state = types.PresenceAvailable
-		}
-		if err := client.SendPresence(r.Context(), state); err != nil {
+		if err := activePresence.setManual(req.Available); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("Failed to send presence: %v", err)})
 			return
@@ -1541,6 +1546,9 @@ func main() {
 		return
 	}
 
+	// Must be set before pairing -- see configureDeviceIdentity.
+	configureDeviceIdentity()
+
 	// Get device store - This contains session information
 	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
@@ -1560,6 +1568,10 @@ func main() {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
 	}
+
+	presence := newPresenceKeeper(client, logger)
+	activePresence = presence
+	go presence.runHeartbeat()
 
 	// Initialize message store
 	messageStore, err := NewMessageStore()
@@ -1582,6 +1594,10 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			go presence.onConnected()
+
+		case *events.PushNameSetting:
+			go presence.onPushName()
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
