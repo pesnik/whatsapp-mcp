@@ -174,6 +174,53 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
+// ---------------------------------------------------------------------------
+// In-memory message cache (last 50 messages per chat) for reply lookup
+// ---------------------------------------------------------------------------
+
+type cachedMessage struct {
+	msgID     string
+	senderJID string
+	body      string
+	ts        int64
+}
+
+var messageCache = struct {
+	sync.RWMutex
+	chats map[string][]cachedMessage // chatJID → messages (oldest first)
+}{chats: make(map[string][]cachedMessage)}
+
+const maxCachedMessages = 50
+
+func cacheMessage(chatJID, msgID, senderJID, body string, ts int64) {
+	if msgID == "" || body == "" {
+		return
+	}
+	messageCache.Lock()
+	defer messageCache.Unlock()
+	msgs := messageCache.chats[chatJID]
+	msgs = append(msgs, cachedMessage{msgID, senderJID, body, ts})
+	if len(msgs) > maxCachedMessages {
+		msgs = msgs[len(msgs)-maxCachedMessages:]
+	}
+	messageCache.chats[chatJID] = msgs
+}
+
+func lookupCachedMessage(chatJID, msgID string) *cachedMessage {
+	if msgID == "" {
+		return nil
+	}
+	messageCache.RLock()
+	defer messageCache.RUnlock()
+	msgs := messageCache.chats[chatJID]
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].msgID == msgID {
+			return &msgs[i]
+		}
+	}
+	return nil
+}
+
 // Extract text content from a message
 func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {
@@ -200,6 +247,24 @@ type AuthState struct {
 	AuthInProgress bool
 }
 
+// PresenceInfo is the last-known presence WhatsApp pushed us for one contact.
+// Only populated for JIDs we've called SubscribePresence on -- WhatsApp does
+// not push presence for anyone we haven't explicitly subscribed to, and even
+// then only if their own privacy settings allow it (LastSeen is the zero
+// value when they've hidden it -- that's enforced server-side, not something
+// this bridge can see around).
+type PresenceInfo struct {
+	Unavailable bool      `json:"unavailable"`
+	LastSeen    time.Time `json:"last_seen,omitempty"`
+}
+
+// presenceCache holds the last PresenceInfo we've observed per JID, filled by
+// the *events.Presence handler below and read back by GET /api/presence/{jid}.
+var presenceCache = struct {
+	sync.RWMutex
+	m map[string]PresenceInfo
+}{m: make(map[string]PresenceInfo)}
+
 var authState = &AuthState{}
 
 // SendMessageResponse represents the response for the send message API
@@ -213,6 +278,30 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+}
+
+// BotSendRequest represents the request body for the /api/messages/send endpoint
+// Used by MentionListener to send bot responses back to WhatsApp
+type BotSendRequest struct {
+	To      string `json:"to"`
+	Message string `json:"message"`
+}
+
+// MentionEvent is emitted to stdout when the bot is mentioned in a chat
+type MentionEvent struct {
+	Type          string `json:"type"`
+	MessageID     string `json:"messageId"`
+	ChatJID       string `json:"chatJid"`
+	ChatName      string `json:"chatName"`
+	SenderJID     string `json:"senderJid"`
+	SenderName    string `json:"senderName"`
+	Body          string `json:"body"`
+	Timestamp     int64  `json:"timestamp"`
+	IsFromMe      bool   `json:"isFromMe"`
+	IsMention     bool   `json:"isMention"`
+	QuotedMsgID   string `json:"quotedMsgId,omitempty"`
+	QuotedMsgBody string `json:"quotedMsgBody,omitempty"`
+	IsReplyToBot  bool   `json:"isReplyToBot,omitempty"`
 }
 
 // Function to send a WhatsApp message
@@ -481,6 +570,114 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 	}
+
+	// Skip mention detection for messages sent by the bot itself
+	if msg.Info.IsFromMe {
+		// Still cache bot's own messages so we can look them up when someone replies
+		cacheMessage(chatJID, msg.Info.ID, sender, content, msg.Info.Timestamp.Unix())
+		return
+	}
+
+	// Cache every incoming message for reply lookup
+	cacheMessage(chatJID, msg.Info.ID, sender, content, msg.Info.Timestamp.Unix())
+
+	// Detect if this is a group chat
+	isGroup := strings.HasSuffix(chatJID, "@g.us")
+
+	// Determine if the bot was mentioned
+	isMentioned := false
+
+	// Detect reply-to-bot
+	isReplyToBot := false
+	quotedMsgID := ""
+	quotedMsgBody := ""
+
+	if isGroup && client.Store.ID != nil {
+		botJID := client.Store.ID
+		botUser := botJID.User
+
+		// Build a set of the bot's own JIDs to match against
+		botJIDs := make(map[string]bool)
+		botJIDs[botUser] = true     // phone number
+		botJIDs[botJID.String()] = true // full JID string
+
+		// Also add the bot's LID (WhatsApp uses LID for contact-based mentions)
+		if ownLID := client.Store.GetLID(); ownLID.User != "" {
+			botJIDs[ownLID.User] = true
+			botJIDs[ownLID.String()] = true
+		}
+
+		if extMsg := msg.Message.GetExtendedTextMessage(); extMsg != nil {
+			ctxInfo := extMsg.GetContextInfo()
+
+			// Check mentions in extended text messages (protocol-level @mentions)
+			for _, mentionedJID := range ctxInfo.GetMentionedJID() {
+				for matchJID := range botJIDs {
+					if strings.HasPrefix(mentionedJID, matchJID) || mentionedJID == matchJID {
+						isMentioned = true
+						break
+					}
+				}
+				if isMentioned {
+					break
+				}
+			}
+
+			// Detect reply-to-bot: ContextInfo.StanzaID is non-empty when replying
+			if stanzaID := ctxInfo.GetStanzaID(); stanzaID != "" {
+				quotedMsgID = stanzaID
+				// Check if participant matches any bot JID
+				participant := ctxInfo.GetParticipant()
+				for matchJID := range botJIDs {
+					if strings.HasPrefix(participant, matchJID) || participant == matchJID {
+						isReplyToBot = true
+						break
+					}
+				}
+				// Look up quoted message body in cache
+				if qMsg := lookupCachedMessage(chatJID, stanzaID); qMsg != nil {
+					quotedMsgBody = qMsg.body
+				}
+			}
+		}
+		// Fallback: also check plain text for @<phone> pattern (non-protocol mentions)
+		if !isMentioned && content != "" {
+			for matchJID := range botJIDs {
+				if strings.Contains(content, "@"+matchJID) {
+					isMentioned = true
+					break
+				}
+			}
+		}
+	} else if !isGroup {
+		// In DMs, all incoming messages are treated as mentions
+		isMentioned = true
+	}
+
+	// Emit if: mentioned, reply-to-bot, or group message (for alias detection in hub)
+	// For DMs, always emit (already treated as mentions above)
+	if !isMentioned && !isReplyToBot && !isGroup {
+		return
+	}
+
+	// Emit structured mention event to stdout for MentionListener
+	evt := MentionEvent{
+		Type:          "mention",
+		MessageID:     msg.Info.ID,
+		ChatJID:       chatJID,
+		ChatName:      name,
+		SenderJID:     sender,
+		SenderName:    name,
+		Body:          content,
+		Timestamp:     msg.Info.Timestamp.Unix(),
+		IsFromMe:      msg.Info.IsFromMe,
+		IsMention:     isMentioned,
+		QuotedMsgID:   quotedMsgID,
+		QuotedMsgBody: quotedMsgBody,
+		IsReplyToBot:  isReplyToBot,
+	}
+	evtJSON, _ := json.Marshal(evt)
+	fmt.Printf("OPENSENSE_BOT_EVENT:%s\n", string(evtJSON))
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -736,6 +933,171 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// POST /api/messages/send -- send a text message (used by MentionListener)
+	http.HandleFunc("/api/messages/send", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req BotSendRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.To == "" {
+			http.Error(w, "to is required", http.StatusBadRequest)
+			return
+		}
+		if req.Message == "" {
+			http.Error(w, "message is required", http.StatusBadRequest)
+			return
+		}
+
+		success, msg := sendWhatsAppMessage(client, req.To, req.Message, "")
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{
+			Success: success,
+			Message: msg,
+		})
+	})
+
+	// GET /api/chats -- list all known chats (groups and DMs)
+	http.HandleFunc("/api/chats", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		chats, err := messageStore.GetChats()
+		if err != nil {
+			http.Error(w, "Failed to get chats", http.StatusInternalServerError)
+			return
+		}
+		type ChatInfo struct {
+			JID       string `json:"jid"`
+			Name      string `json:"name"`
+			IsGroup   bool   `json:"is_group"`
+			LastActive int64  `json:"last_active"`
+		}
+		var result []ChatInfo
+		for jid, t := range chats {
+			name := ""
+			err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", jid).Scan(&name)
+			if err != nil {
+				name = ""
+			}
+			result = append(result, ChatInfo{
+				JID:       jid,
+				Name:      name,
+				IsGroup:   strings.HasSuffix(jid, "@g.us"),
+				LastActive: t.Unix(),
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	})
+
+	// POST /api/presence -- broadcast our own online/offline status.
+	// Deliberately a manual, agent-invoked action, not an automatic
+	// background ping loop: an account that's *always* online 24/7 is
+	// itself a detectable automation signal (confirmed against a sibling
+	// fork's own docs, which pings on a 20min+ interval specifically to
+	// avoid that) -- left as a tool the calling agent decides when to use,
+	// same as send_message, rather than new always-on scheduler infra.
+	http.HandleFunc("/api/presence", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		var req struct {
+			Available bool `json:"available"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "Invalid request format"})
+			return
+		}
+
+		state := types.PresenceUnavailable
+		if req.Available {
+			state = types.PresenceAvailable
+		}
+		if err := client.SendPresence(r.Context(), state); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("Failed to send presence: %v", err)})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Presence updated"})
+	})
+
+	// POST /api/presence/subscribe -- ask WhatsApp to start pushing us
+	// presence updates for one contact. Required before GET
+	// /api/presence/{jid} below will ever return anything for that
+	// contact; WhatsApp does not push presence unsolicited.
+	http.HandleFunc("/api/presence/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		var req struct {
+			JID string `json:"jid"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.JID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "jid is required"})
+			return
+		}
+
+		jid, err := types.ParseJID(req.JID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("Invalid JID: %v", err)})
+			return
+		}
+		if err := client.SubscribePresence(r.Context(), jid); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("Failed to subscribe: %v", err)})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": "Subscribed"})
+	})
+
+	// GET /api/presence?jid=... -- last-known presence for a contact
+	// we've subscribed to (empty/absent until at least one events.Presence
+	// has arrived for it).
+	http.HandleFunc("/api/presence/get", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		jid := r.URL.Query().Get("jid")
+		if jid == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "jid query param is required"})
+			return
+		}
+
+		presenceCache.RLock()
+		info, ok := presenceCache.m[jid]
+		presenceCache.RUnlock()
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "No presence known for this JID yet -- subscribe first, then wait for an update"})
+			return
+		}
+
+		resp := map[string]interface{}{"success": true, "unavailable": info.Unavailable}
+		if !info.LastSeen.IsZero() {
+			resp["last_seen"] = info.LastSeen.Unix()
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -953,6 +1315,14 @@ func main() {
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+
+		case *events.Presence:
+			presenceCache.Lock()
+			presenceCache.m[v.From.String()] = PresenceInfo{
+				Unavailable: v.Unavailable,
+				LastSeen:    v.LastSeen,
+			}
+			presenceCache.Unlock()
 		}
 	})
 

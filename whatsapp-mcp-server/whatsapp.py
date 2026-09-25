@@ -623,15 +623,73 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         if 'conn' in locals():
             conn.close()
 
+
+def _looks_like_jid_or_phone(recipient: str) -> bool:
+    """A real JID ('...@s.whatsapp.net' / '...@g.us') or a bare phone
+    number (digits only, no @) -- send_message's own documented input
+    shape. Anything else is a display name to resolve, not something to
+    guess a JID from."""
+    if recipient.endswith("@s.whatsapp.net") or recipient.endswith("@g.us"):
+        return True
+    return recipient.isdigit()
+
+
+def _resolve_recipient(recipient: str) -> Tuple[Optional[str], Optional[str]]:
+    """Resolves a plain display name to a real JID via the same local,
+    already-synced chats lookup list_chats already uses -- a cheap
+    SQLite query, not a network round-trip, so this is safe to do
+    inline before every send.
+
+    Root-caused live against a real production failure: send_message
+    used to accept *any* string, pass it straight through to the
+    underlying WhatsApp send unchanged, and hang for 30+ seconds on a
+    live WhatsApp protocol timeout ("usync query timed out") when it
+    wasn't a real JID -- by the time that failed, the calling MCP
+    client had already given up and surfaced its own generic timeout,
+    with no indication of what actually went wrong. Failing fast here,
+    in well under a second, with the real candidate list, is the whole
+    point of this function -- and it only ever resolves automatically
+    on a confident single match; it never guesses among several.
+
+    Returns (resolved_jid, None) on a match, or (None, error_message)
+    when nothing should be sent yet.
+    """
+    if _looks_like_jid_or_phone(recipient):
+        return recipient, None
+
+    matches = list_chats(query=recipient, limit=10)
+    exact = [c for c in matches if c.name and c.name.strip().lower() == recipient.strip().lower()]
+    candidates = exact if exact else matches
+
+    if len(candidates) == 1:
+        return candidates[0].jid, None
+
+    if not candidates:
+        return None, (
+            f"'{recipient}' isn't a WhatsApp ID and didn't match any known chat or contact by name. "
+            "Use list_chats or search_contacts to find the right one, or ask the user for the correct name/number."
+        )
+
+    listing = "; ".join(f"{c.name or c.jid} ({c.jid})" for c in candidates[:5])
+    return None, (
+        f"'{recipient}' matched {len(candidates)} chats, not exactly one: {listing}. "
+        "Ask the user which one they mean, or use the exact JID."
+    )
+
+
 def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
+        resolved_recipient, resolution_error = _resolve_recipient(recipient)
+        if resolution_error:
+            return False, resolution_error
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
-            "recipient": recipient,
+            "recipient": resolved_recipient,
             "message": message,
         }
         
@@ -651,18 +709,86 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
+def set_presence(available: bool) -> Tuple[bool, str]:
+    """Broadcast this account's own online/offline status. A manual action,
+    not an automatic background ping -- an account that's always online is
+    itself a detectable automation signal, so the caller decides when."""
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/presence"
+        response = requests.post(url, json={"available": available})
+
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def subscribe_presence(jid: str) -> Tuple[bool, str]:
+    """Ask WhatsApp to start pushing presence updates for one contact.
+    Required before get_presence will ever return anything for them --
+    WhatsApp never pushes presence unsolicited, and even after subscribing,
+    what comes back is still subject to that contact's own privacy settings."""
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/presence/subscribe"
+        response = requests.post(url, json={"jid": jid})
+
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def get_presence(jid: str) -> Optional[dict]:
+    """Last-known presence for a subscribed contact: {"unavailable": bool,
+    "last_seen": unix_timestamp (omitted if they've hidden it)}. None if we
+    haven't seen an update for them yet (subscribe, then this needs a
+    moment for WhatsApp to actually push one)."""
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/presence/get"
+        response = requests.get(url, params={"jid": jid})
+
+        if response.status_code != 200:
+            return None
+        result = response.json()
+        if not result.get("success"):
+            return None
+        return {"unavailable": result.get("unavailable", False), "last_seen": result.get("last_seen")}
+
+    except (requests.RequestException, json.JSONDecodeError):
+        return None
+
 def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         if not media_path:
             return False, "Media path must be provided"
-        
+
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
-        
+
+        # Same name-vs-JID resolution as send_message -- see
+        # _resolve_recipient's own docstring for why this exists.
+        recipient, resolution_error = _resolve_recipient(recipient)
+        if resolution_error:
+            return False, resolution_error
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
@@ -690,12 +816,18 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         if not media_path:
             return False, "Media path must be provided"
-        
+
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
+
+        # Same name-vs-JID resolution as send_message -- see
+        # _resolve_recipient's own docstring for why this exists.
+        recipient, resolution_error = _resolve_recipient(recipient)
+        if resolution_error:
+            return False, resolution_error
 
         if not media_path.endswith(".ogg"):
             try:
