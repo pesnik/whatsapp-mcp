@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -162,4 +163,59 @@ func (p *presenceKeeper) runHeartbeat() {
 			p.activeFor(heartbeatPulse)
 		}
 	}
+}
+
+// ownJIDUsers returns the user parts this account is known by (phone number
+// and LID) -- for matching senders and mentions against ourselves.
+func ownJIDUsers(client *whatsmeow.Client) map[string]bool {
+	users := map[string]bool{}
+	if client.Store.ID != nil {
+		users[client.Store.ID.User] = true
+	}
+	if lid := client.Store.GetLID(); lid.User != "" {
+		users[lid.User] = true
+	}
+	return users
+}
+
+// senderIsSelf reports whether a message was written from this same account
+// (the owner's phone or another of their devices).
+func senderIsSelf(client *whatsmeow.Client, info types.MessageInfo) bool {
+	own := ownJIDUsers(client)
+	return (info.Sender.User != "" && own[info.Sender.User]) || (info.SenderAlt.User != "" && own[info.SenderAlt.User])
+}
+
+// resolveMentionTokens turns WhatsApp's raw "@<number-or-LID>" mention
+// tokens into "@<name>", so the agent reads "@Rakibul Hasan are you there?"
+// rather than "@12345678901234 are you there?". Unknown JIDs are left as-is.
+func resolveMentionTokens(client *whatsmeow.Client, body string, mentioned []string) string {
+	if body == "" || len(mentioned) == 0 {
+		return body
+	}
+	own := ownJIDUsers(client)
+	for _, raw := range mentioned {
+		jid, err := types.ParseJID(raw)
+		if err != nil || jid.User == "" {
+			continue
+		}
+		token := "@" + jid.User
+		if !strings.Contains(body, token) {
+			continue
+		}
+		name := ""
+		if own[jid.User] {
+			name = client.Store.PushName
+		} else if c, err := client.Store.Contacts.GetContact(context.Background(), jid.ToNonAD()); err == nil && c.Found {
+			for _, n := range []string{c.FullName, c.PushName, c.FirstName, c.BusinessName} {
+				if n != "" {
+					name = n
+					break
+				}
+			}
+		}
+		if name != "" {
+			body = strings.ReplaceAll(body, token, "@"+name)
+		}
+	}
+	return body
 }

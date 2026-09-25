@@ -790,10 +790,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 	}
 
-	// The account owner's own messages (typed on their phone) are emitted as
-	// context only -- the Hub never treats isFromMe as a trigger, but the agent
-	// answering on this account must know what its owner already said.
-	if !msg.Info.IsFromMe {
+	// The account owner's own messages (typed on their phone) are context, and
+	// a trigger only when the owner explicitly @-mentions their own account --
+	// that's the owner instructing the assistant. In LID-addressed groups
+	// whatsmeow can report the owner's phone messages with IsFromMe=false, so
+	// ownership is also decided by comparing the sender with our own JIDs.
+	isOwner := msg.Info.IsFromMe || senderIsSelf(client, msg.Info)
+	{
 		if isGroup && client.Store.ID != nil {
 			botJID := client.Store.ID
 			botJIDs := map[string]bool{botJID.User: true, botJID.String(): true}
@@ -819,7 +822,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 					break
 				}
 			}
-			isReplyToBot = quotedMsgID != "" && matchesBot(quotedSenderJID)
+			// Replying to one of this account's messages only addresses the
+			// bot when someone else does it.
+			isReplyToBot = !isOwner && quotedMsgID != "" && matchesBot(quotedSenderJID)
 			// Fallback: plain-text @<phone> (non-protocol mentions)
 			if !isMentioned && content != "" {
 				for matchJID := range botJIDs {
@@ -829,11 +834,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 					}
 				}
 			}
-		} else if !isGroup {
+		} else if !isGroup && !isOwner {
 			// In DMs, every incoming message is addressed to us
 			isMentioned = true
 		}
 	}
+	body := resolveMentionTokens(client, content, ctxInfo.GetMentionedJID())
 
 	// Emit every group/DM message: triggers (mention, reply-to-bot, DM) and
 	// ambient context alike. The Hub decides what wakes the agent.
@@ -845,9 +851,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		SenderJID:       msg.Info.Sender.ToNonAD().String(),
 		SenderName:      senderName,
 		SenderPhone:     senderPhone(msg.Info),
-		Body:            content,
+		Body:            body,
 		Timestamp:       msg.Info.Timestamp.Unix(),
-		IsFromMe:        msg.Info.IsFromMe,
+		IsFromMe:        isOwner,
 		IsMention:       isMentioned,
 		QuotedMsgID:     quotedMsgID,
 		QuotedMsgBody:   quotedMsgBody,
