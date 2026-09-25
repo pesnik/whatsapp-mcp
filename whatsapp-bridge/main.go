@@ -1487,6 +1487,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 		if client.Store.ID != nil {
 			resp["phone"] = client.Store.ID.User
+			// The account's own WhatsApp display name -- the Hub tells the agent
+			// "this is you", so a mention rendered as "@<name>" isn't mistaken for
+			// someone else.
+			if client.Store.PushName != "" {
+				resp["push_name"] = client.Store.PushName
+			}
 		}
 		json.NewEncoder(w).Encode(resp)
 	})
