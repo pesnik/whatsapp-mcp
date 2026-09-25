@@ -4,9 +4,29 @@ A Model Context Protocol (MCP) server for WhatsApp. Search and read your persona
 
 Connects to your **personal WhatsApp account** via the WhatsApp Web multidevice API using [whatsmeow](https://github.com/tulir/whatsmeow). All messages are stored locally in SQLite and only sent to an LLM when tools are invoked.
 
+> **Fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp)** — customized for [opencode-hub](https://github.com/pesnik/opencode-hub) integration with bot mention detection, reply-to-bot conversation continuity, and progressive disclosure context.
+
 ![WhatsApp MCP](./example-use.png)
 
 > *Caution:* as with many MCP servers, this project is subject to [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). Prompt injection could lead to private data exfiltration.
+
+---
+
+## Features
+
+### Core (upstream)
+- MCP tools for searching contacts, chats, and messages
+- Send messages, files, and audio to individuals or groups
+- Download media from messages
+- Local SQLite storage — no cloud dependency
+
+### opencode-hub Integration (this fork)
+- **Bot mention detection** — protocol-level JID mentions + LID-based detection for contact-name mentions
+- **Reply-to-bot detection** — when a human replies to the bot's message (even without `@`), the bot understands the context via quoted message content
+- **In-memory message cache** — last 50 messages per chat cached for instant reply lookup (no DB hit)
+- **Structured bot events** — `OPENSENSE_BOT_EVENT` JSON emitted to stdout for hub listener consumption
+- **Progressive disclosure** — quoted message body included in agent prompt for conversation continuity
+- **Alias-based mention detection** — hub listener matches `@alias` patterns in message text
 
 ---
 
@@ -134,7 +154,7 @@ docker compose run --rm -it bridge
 ### Option B — Local Go
 
 **Prerequisites**
-- Go 1.21+
+- Go 1.26+
 - Python 3.6+
 - `uv` — `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - FFmpeg *(optional)* — only needed to auto-convert audio to WhatsApp voice messages
@@ -202,23 +222,62 @@ Save to `~/Library/Application Support/Claude/claude_desktop_config.json` (Claud
 ## Architecture
 
 ```
-Claude Desktop
-     │ stdio (MCP)
+opencode-hub
+     │ docker logs (JSON events)
      ▼
-Python MCP server          reads SQLite directly
-(whatsapp-mcp-server/)  ──────────────────────────► store/messages.db
-     │ HTTP REST                                           ▲
-     ▼                                                     │ writes
-Go bridge                  ────────────────────────────────┘
-(whatsapp-bridge/)
+MentionListener           ←── listens for OPENSENSE_BOT_EVENT
+(packages/hub/src/)
+     │ createTask + runTaskWorker
+     ▼
+Agent (opencode)          ←── receives prompt with quoted context
+     │ task output
+     ▼
+MentionListener           ←── sendMessageToChat via bridge REST API
+     │ HTTP POST /api/messages/send
+     ▼
+Go bridge (whatsapp-bridge/)
      │ WhatsApp Web (whatsmeow)
      ▼
 WhatsApp
 ```
 
-- **Go bridge** — connects to WhatsApp, keeps SQLite up to date, exposes REST API on `:8080`
+### Components
+
+- **Go bridge** — connects to WhatsApp, keeps SQLite up to date, exposes REST API on `:8080`, emits structured `OPENSENSE_BOT_EVENT` JSON for bot mentions
 - **Python MCP server** — implements MCP protocol, reads SQLite directly and calls REST API
+- **Hub MentionListener** — streams docker logs, creates agent tasks, sends replies via bridge
 - **store/** — bind-mounted to host; contains `whatsapp.db` (session) and `messages.db` (history)
+
+### Bot Event Flow
+
+```
+1. Human sends message in WhatsApp group
+2. Go bridge detects mention (JID, LID, or alias) or reply-to-bot
+3. Go bridge emits OPENSENSE_BOT_EVENT JSON to stdout
+4. Hub MentionListener streams docker logs, parses event
+5. Listener builds prompt with quoted message context (progressive disclosure)
+6. Agent receives task, generates response
+7. Listener sends response back via bridge REST API
+8. Human sees bot reply in WhatsApp
+```
+
+---
+
+## Bot Mention Detection
+
+The Go bridge detects bot mentions via three methods:
+
+1. **Protocol-level JID mentions** — WhatsApp's `@mention` system (when you type `@` and select a contact)
+2. **LID-based detection** — WhatsApp uses LID (Linked Device ID) when someone selects a contact by name; the bridge matches against both phone number and LID
+3. **Text-based alias matching** — hub listener checks message text for `@alias` patterns configured per user
+
+### Reply-to-Bot Detection
+
+When a human uses WhatsApp's "Reply" feature on the bot's message:
+- `ContextInfo.StanzaID` identifies the original bot message
+- `ContextInfo.Participant` is checked against bot JIDs
+- Quoted message body is looked up from the in-memory cache
+- Event is emitted even without `@`-mention (conversation continuity)
 
 ---
 
@@ -238,6 +297,23 @@ WhatsApp
 | `send_file` | Send image, video, document, or raw audio |
 | `send_audio_message` | Send audio as a WhatsApp voice message (ogg/opus; FFmpeg auto-converts other formats) |
 | `download_media` | Download media from a message, returns local path |
+
+---
+
+## REST API (Go Bridge)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/auth/status` | GET | Connection and login status |
+| `/api/auth/qr` | GET | QR code as base64 PNG (during pairing) |
+| `/api/auth/logout` | POST | Disconnect and clear session |
+| `/api/send` | POST | Send message or media |
+| `/api/messages/send` | POST | Send text message (used by MentionListener) |
+| `/api/chats` | GET | List all known chats |
+| `/api/download` | POST | Download media from a message |
+| `/api/presence` | POST | Set online/offline presence |
+| `/api/presence/subscribe` | POST | Subscribe to presence updates for a contact |
+| `/api/presence/get` | GET | Get last-known presence for a contact |
 
 ---
 
@@ -264,5 +340,10 @@ docker compose run --rm -it bridge   # re-scan QR
 
 **uv not found**
 Use the full path from `which uv` in the Claude Desktop config.
+
+**Bot not responding to mentions**
+- Check bridge is connected: `curl http://localhost:8080/api/auth/status`
+- Check hub listener is running: `docker logs opencode-hub | grep listener`
+- Verify bot status in DB: `sqlite3 /data/opencode-hub.sqlite "SELECT status FROM whatsapp_bot_settings WHERE user_id = 'YOUR_USER_ID'"`
 
 For MCP-specific issues see the [MCP troubleshooting docs](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues).
