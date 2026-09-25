@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -92,6 +93,19 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Context-engineering columns, added after the original schema. SQLite has
+	// no ADD COLUMN IF NOT EXISTS, so a "duplicate column" error on an already
+	// migrated store is expected and ignored.
+	for _, stmt := range []string{
+		"ALTER TABLE messages ADD COLUMN sender_name TEXT",
+		"ALTER TABLE messages ADD COLUMN quoted_msg_id TEXT",
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("failed to migrate messages table: %v", err)
+		}
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -124,6 +138,63 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
+}
+
+// StoreMessageMeta records who sent a message (display name) and what it
+// quoted, alongside a row StoreMessage already wrote.
+func (store *MessageStore) StoreMessageMeta(id, chatJID, senderName, quotedMsgID string) error {
+	_, err := store.db.Exec(
+		"UPDATE messages SET sender_name = ?, quoted_msg_id = ? WHERE id = ? AND chat_jid = ?",
+		senderName, quotedMsgID, id, chatJID,
+	)
+	return err
+}
+
+// LookupMessageBody returns the stored text of one message ("" if unknown).
+func (store *MessageStore) LookupMessageBody(chatJID, id string) string {
+	var body sql.NullString
+	_ = store.db.QueryRow("SELECT content FROM messages WHERE id = ? AND chat_jid = ?", id, chatJID).Scan(&body)
+	return body.String
+}
+
+// HistoryMessage is one row of GET /api/messages/since -- the Hub's backfill
+// source after its listener was down.
+type HistoryMessage struct {
+	ID          string `json:"id"`
+	ChatJID     string `json:"chatJid"`
+	Sender      string `json:"sender"`
+	SenderName  string `json:"senderName"`
+	Content     string `json:"content"`
+	Timestamp   int64  `json:"timestamp"`
+	IsFromMe    bool   `json:"isFromMe"`
+	MediaType   string `json:"mediaType,omitempty"`
+	Filename    string `json:"filename,omitempty"`
+	QuotedMsgID string `json:"quotedMsgId,omitempty"`
+}
+
+// GetMessagesSince returns a chat's messages strictly after afterUnix, oldest first.
+func (store *MessageStore) GetMessagesSince(chatJID string, afterUnix int64, limit int) ([]HistoryMessage, error) {
+	rows, err := store.db.Query(
+		`SELECT id, chat_jid, sender, COALESCE(sender_name, ''), COALESCE(content, ''), timestamp, is_from_me,
+		        COALESCE(media_type, ''), COALESCE(filename, ''), COALESCE(quoted_msg_id, '')
+		 FROM messages WHERE chat_jid = ? AND timestamp > ? ORDER BY timestamp ASC LIMIT ?`,
+		chatJID, time.Unix(afterUnix, 0), limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []HistoryMessage
+	for rows.Next() {
+		var m HistoryMessage
+		var ts time.Time
+		if err := rows.Scan(&m.ID, &m.ChatJID, &m.Sender, &m.SenderName, &m.Content, &ts, &m.IsFromMe, &m.MediaType, &m.Filename, &m.QuotedMsgID); err != nil {
+			return nil, err
+		}
+		m.Timestamp = ts.Unix()
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }
 
 // Get messages from a chat
@@ -234,7 +305,77 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Captions on media are real text people write ("see this @bot") --
+	// without them a captioned image is invisible to mention detection and
+	// to the agent's context.
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+	return ""
+}
+
+// contextInfoOf returns the ContextInfo (mentions, quoted message) of any
+// message type that carries one -- not only ExtendedTextMessage, so a reply
+// or @mention on a captioned image/video/document is detected too.
+func contextInfoOf(msg *waProto.Message) *waProto.ContextInfo {
+	if msg == nil {
+		return nil
+	}
+	switch {
+	case msg.GetExtendedTextMessage() != nil:
+		return msg.GetExtendedTextMessage().GetContextInfo()
+	case msg.GetImageMessage() != nil:
+		return msg.GetImageMessage().GetContextInfo()
+	case msg.GetVideoMessage() != nil:
+		return msg.GetVideoMessage().GetContextInfo()
+	case msg.GetDocumentMessage() != nil:
+		return msg.GetDocumentMessage().GetContextInfo()
+	case msg.GetAudioMessage() != nil:
+		return msg.GetAudioMessage().GetContextInfo()
+	case msg.GetStickerMessage() != nil:
+		return msg.GetStickerMessage().GetContextInfo()
+	}
+	return nil
+}
+
+// senderDisplayName picks the best human name for a message's sender: the
+// push name the sender set on their own phone, then whatever the contact
+// store knows. "" when nothing is known (the Hub falls back to the number).
+func senderDisplayName(client *whatsmeow.Client, info types.MessageInfo) string {
+	if info.PushName != "" {
+		return info.PushName
+	}
+	for _, jid := range []types.JID{info.Sender.ToNonAD(), info.SenderAlt.ToNonAD()} {
+		if jid.User == "" {
+			continue
+		}
+		if c, err := client.Store.Contacts.GetContact(context.Background(), jid); err == nil && c.Found {
+			for _, n := range []string{c.FullName, c.FirstName, c.PushName, c.BusinessName} {
+				if n != "" {
+					return n
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// senderPhone returns the sender's phone-number user part when WhatsApp gave
+// us one -- groups increasingly address members by LID, with the phone number
+// (when shared) only in SenderAlt.
+func senderPhone(info types.MessageInfo) string {
+	if info.Sender.Server == types.DefaultUserServer {
+		return info.Sender.User
+	}
+	if info.SenderAlt.Server == types.DefaultUserServer {
+		return info.SenderAlt.User
+	}
 	return ""
 }
 
@@ -285,6 +426,35 @@ type SendMessageRequest struct {
 type BotSendRequest struct {
 	To      string `json:"to"`
 	Message string `json:"message"`
+	// Optional: send as a WhatsApp quote-reply to this message.
+	ReplyTo *struct {
+		ID          string `json:"id"`
+		Participant string `json:"participant"`
+		Text        string `json:"text"`
+	} `json:"reply_to,omitempty"`
+}
+
+// activeMessageStore lets send paths persist what this device sends --
+// whatsmeow doesn't echo a message back to the device that sent it, so
+// without this the bot's own replies never reach messages.db.
+var activeMessageStore *MessageStore
+
+// recordSentMessage stores an outgoing text message and caches it for
+// reply lookup.
+func recordSentMessage(client *whatsmeow.Client, chat types.JID, id types.MessageID, ts time.Time, text, quotedID string) {
+	own := ""
+	if client.Store.ID != nil {
+		own = client.Store.ID.User
+	}
+	cacheMessage(chat.String(), id, own, text, ts.Unix())
+	if activeMessageStore == nil {
+		return
+	}
+	if err := activeMessageStore.StoreMessage(id, chat.String(), own, text, ts, true, "", "", "", nil, nil, nil, 0); err != nil {
+		fmt.Printf("failed to store sent message %s: %v\n", id, err)
+		return
+	}
+	_ = activeMessageStore.StoreMessageMeta(id, chat.String(), "", quotedID)
 }
 
 // MentionEvent is emitted to stdout when the bot is mentioned in a chat
@@ -302,6 +472,12 @@ type MentionEvent struct {
 	QuotedMsgID   string `json:"quotedMsgId,omitempty"`
 	QuotedMsgBody string `json:"quotedMsgBody,omitempty"`
 	IsReplyToBot  bool   `json:"isReplyToBot,omitempty"`
+	// Phone number of the sender when known (SenderJID may be a LID).
+	SenderPhone string `json:"senderPhone,omitempty"`
+	// JID of whoever wrote the quoted message (not only "was it the bot").
+	QuotedSenderJID string `json:"quotedSenderJid,omitempty"`
+	MediaType       string `json:"mediaType,omitempty"`
+	Filename        string `json:"filename,omitempty"`
 }
 
 // Function to send a WhatsApp message
@@ -464,10 +640,13 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	sendResp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+	if mediaPath == "" {
+		recordSentMessage(client, recipientJID, sendResp.ID, sendResp.Timestamp, message, "")
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -571,110 +750,108 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 	}
 
-	// Skip mention detection for messages sent by the bot itself
-	if msg.Info.IsFromMe {
-		// Still cache bot's own messages so we can look them up when someone replies
-		cacheMessage(chatJID, msg.Info.ID, sender, content, msg.Info.Timestamp.Unix())
+	// Status updates and channels are not conversations the bot takes part in.
+	if chatJID == "status@broadcast" || strings.HasSuffix(chatJID, "@newsletter") || strings.HasSuffix(chatJID, "@broadcast") {
 		return
 	}
 
-	// Cache every incoming message for reply lookup
+	ctxInfo := contextInfoOf(msg.Message)
+	quotedMsgID := ctxInfo.GetStanzaID()
+	senderName := senderDisplayName(client, msg.Info)
+	if err == nil {
+		if metaErr := messageStore.StoreMessageMeta(msg.Info.ID, chatJID, senderName, quotedMsgID); metaErr != nil {
+			logger.Warnf("Failed to store message meta: %v", metaErr)
+		}
+	}
+
+	// Cache every message (incoming and our own) for reply lookup
 	cacheMessage(chatJID, msg.Info.ID, sender, content, msg.Info.Timestamp.Unix())
 
-	// Detect if this is a group chat
 	isGroup := strings.HasSuffix(chatJID, "@g.us")
-
-	// Determine if the bot was mentioned
 	isMentioned := false
-
-	// Detect reply-to-bot
 	isReplyToBot := false
-	quotedMsgID := ""
 	quotedMsgBody := ""
+	quotedSenderJID := ""
 
-	if isGroup && client.Store.ID != nil {
-		botJID := client.Store.ID
-		botUser := botJID.User
-
-		// Build a set of the bot's own JIDs to match against
-		botJIDs := make(map[string]bool)
-		botJIDs[botUser] = true     // phone number
-		botJIDs[botJID.String()] = true // full JID string
-
-		// Also add the bot's LID (WhatsApp uses LID for contact-based mentions)
-		if ownLID := client.Store.GetLID(); ownLID.User != "" {
-			botJIDs[ownLID.User] = true
-			botJIDs[ownLID.String()] = true
+	// Quoted text travels inside the reply itself (ContextInfo.QuotedMessage);
+	// the cache/DB are only fallbacks for clients that omit it.
+	if quotedMsgID != "" {
+		quotedSenderJID = ctxInfo.GetParticipant()
+		quotedMsgBody = extractTextContent(ctxInfo.GetQuotedMessage())
+		if quotedMsgBody == "" {
+			if qMsg := lookupCachedMessage(chatJID, quotedMsgID); qMsg != nil {
+				quotedMsgBody = qMsg.body
+			} else {
+				quotedMsgBody = messageStore.LookupMessageBody(chatJID, quotedMsgID)
+			}
 		}
+	}
 
-		if extMsg := msg.Message.GetExtendedTextMessage(); extMsg != nil {
-			ctxInfo := extMsg.GetContextInfo()
-
-			// Check mentions in extended text messages (protocol-level @mentions)
+	// The account owner's own messages (typed on their phone) are emitted as
+	// context only -- the Hub never treats isFromMe as a trigger, but the agent
+	// answering on this account must know what its owner already said.
+	if !msg.Info.IsFromMe {
+		if isGroup && client.Store.ID != nil {
+			botJID := client.Store.ID
+			botJIDs := map[string]bool{botJID.User: true, botJID.String(): true}
+			// WhatsApp uses LID for contact-based mentions
+			if ownLID := client.Store.GetLID(); ownLID.User != "" {
+				botJIDs[ownLID.User] = true
+				botJIDs[ownLID.String()] = true
+			}
+			matchesBot := func(jid string) bool {
+				if jid == "" {
+					return false
+				}
+				for matchJID := range botJIDs {
+					if jid == matchJID || strings.HasPrefix(jid, matchJID+"@") || strings.HasPrefix(jid, matchJID+":") {
+						return true
+					}
+				}
+				return false
+			}
 			for _, mentionedJID := range ctxInfo.GetMentionedJID() {
-				for matchJID := range botJIDs {
-					if strings.HasPrefix(mentionedJID, matchJID) || mentionedJID == matchJID {
-						isMentioned = true
-						break
-					}
-				}
-				if isMentioned {
-					break
-				}
-			}
-
-			// Detect reply-to-bot: ContextInfo.StanzaID is non-empty when replying
-			if stanzaID := ctxInfo.GetStanzaID(); stanzaID != "" {
-				quotedMsgID = stanzaID
-				// Check if participant matches any bot JID
-				participant := ctxInfo.GetParticipant()
-				for matchJID := range botJIDs {
-					if strings.HasPrefix(participant, matchJID) || participant == matchJID {
-						isReplyToBot = true
-						break
-					}
-				}
-				// Look up quoted message body in cache
-				if qMsg := lookupCachedMessage(chatJID, stanzaID); qMsg != nil {
-					quotedMsgBody = qMsg.body
-				}
-			}
-		}
-		// Fallback: also check plain text for @<phone> pattern (non-protocol mentions)
-		if !isMentioned && content != "" {
-			for matchJID := range botJIDs {
-				if strings.Contains(content, "@"+matchJID) {
+				if matchesBot(mentionedJID) {
 					isMentioned = true
 					break
 				}
 			}
+			isReplyToBot = quotedMsgID != "" && matchesBot(quotedSenderJID)
+			// Fallback: plain-text @<phone> (non-protocol mentions)
+			if !isMentioned && content != "" {
+				for matchJID := range botJIDs {
+					if strings.Contains(content, "@"+matchJID) {
+						isMentioned = true
+						break
+					}
+				}
+			}
+		} else if !isGroup {
+			// In DMs, every incoming message is addressed to us
+			isMentioned = true
 		}
-	} else if !isGroup {
-		// In DMs, all incoming messages are treated as mentions
-		isMentioned = true
 	}
 
-	// Emit if: mentioned, reply-to-bot, or group message (for alias detection in hub)
-	// For DMs, always emit (already treated as mentions above)
-	if !isMentioned && !isReplyToBot && !isGroup {
-		return
-	}
-
-	// Emit structured mention event to stdout for MentionListener
+	// Emit every group/DM message: triggers (mention, reply-to-bot, DM) and
+	// ambient context alike. The Hub decides what wakes the agent.
 	evt := MentionEvent{
-		Type:          "mention",
-		MessageID:     msg.Info.ID,
-		ChatJID:       chatJID,
-		ChatName:      name,
-		SenderJID:     sender,
-		SenderName:    name,
-		Body:          content,
-		Timestamp:     msg.Info.Timestamp.Unix(),
-		IsFromMe:      msg.Info.IsFromMe,
-		IsMention:     isMentioned,
-		QuotedMsgID:   quotedMsgID,
-		QuotedMsgBody: quotedMsgBody,
-		IsReplyToBot:  isReplyToBot,
+		Type:            "mention",
+		MessageID:       msg.Info.ID,
+		ChatJID:         chatJID,
+		ChatName:        name,
+		SenderJID:       msg.Info.Sender.ToNonAD().String(),
+		SenderName:      senderName,
+		SenderPhone:     senderPhone(msg.Info),
+		Body:            content,
+		Timestamp:       msg.Info.Timestamp.Unix(),
+		IsFromMe:        msg.Info.IsFromMe,
+		IsMention:       isMentioned,
+		QuotedMsgID:     quotedMsgID,
+		QuotedMsgBody:   quotedMsgBody,
+		QuotedSenderJID: quotedSenderJID,
+		IsReplyToBot:    isReplyToBot,
+		MediaType:       mediaType,
+		Filename:        filename,
 	}
 	evtJSON, _ := json.Marshal(evt)
 	fmt.Printf("OPENSENSE_BOT_EVENT:%s\n", string(evtJSON))
@@ -955,15 +1132,108 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		success, msg := sendWhatsAppMessage(client, req.To, req.Message, "")
 		w.Header().Set("Content-Type", "application/json")
-		if !success {
-			w.WriteHeader(http.StatusInternalServerError)
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "Not connected to WhatsApp"})
+			return
 		}
-		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: msg,
+		to, err := types.ParseJID(req.To)
+		if err != nil || !strings.Contains(req.To, "@") {
+			to = types.JID{User: req.To, Server: types.DefaultUserServer}
+		}
+		// A plain Conversation can't carry a quote; ExtendedTextMessage can.
+		msg := &waProto.Message{Conversation: proto.String(req.Message)}
+		quotedID := ""
+		if req.ReplyTo != nil && req.ReplyTo.ID != "" {
+			quotedID = req.ReplyTo.ID
+			ctx := &waProto.ContextInfo{
+				StanzaID:      proto.String(req.ReplyTo.ID),
+				QuotedMessage: &waProto.Message{Conversation: proto.String(req.ReplyTo.Text)},
+			}
+			if req.ReplyTo.Participant != "" {
+				ctx.Participant = proto.String(req.ReplyTo.Participant)
+			}
+			msg = &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{
+				Text:        proto.String(req.Message),
+				ContextInfo: ctx,
+			}}
+		}
+		resp, err := client.SendMessage(r.Context(), to, msg)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("Error sending message: %v", err)})
+			return
+		}
+		recordSentMessage(client, to, resp.ID, resp.Timestamp, req.Message, quotedID)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   true,
+			"message":   "sent",
+			"id":        resp.ID,
+			"timestamp": resp.Timestamp.Unix(),
 		})
+	})
+
+	// POST /api/chat-presence -- "typing..." indicator in one chat while the
+	// agent works (state: composing | paused).
+	http.HandleFunc("/api/chat-presence", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			JID   string `json:"jid"`
+			State string `json:"state"`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.JID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "jid is required"})
+			return
+		}
+		jid, err := types.ParseJID(req.JID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": fmt.Sprintf("Invalid JID: %v", err)})
+			return
+		}
+		state := types.ChatPresenceComposing
+		if req.State == "paused" {
+			state = types.ChatPresencePaused
+		}
+		if err := client.SendChatPresence(r.Context(), jid, state, types.ChatPresenceMediaText); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+	})
+
+	// GET /api/messages/since?chat_jid=...&after=<unix>&limit=N -- backfill
+	// for the Hub after its listener was down (oldest first).
+	http.HandleFunc("/api/messages/since", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		chat := r.URL.Query().Get("chat_jid")
+		if chat == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": "chat_jid is required"})
+			return
+		}
+		after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		if limit <= 0 || limit > 500 {
+			limit = 200
+		}
+		msgs, err := messageStore.GetMessagesSince(chat, after, limit)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": err.Error()})
+			return
+		}
+		if msgs == nil {
+			msgs = []HistoryMessage{}
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "messages": msgs})
 	})
 
 	// GET /api/chats -- list all known chats (groups and DMs)
@@ -1330,6 +1600,7 @@ func main() {
 	connected := make(chan bool, 1)
 
 	// Start REST API server early so /api/auth/qr is reachable during QR flow
+	activeMessageStore = messageStore
 	startRESTServer(client, messageStore, 8080)
 
 	// Connect to WhatsApp
